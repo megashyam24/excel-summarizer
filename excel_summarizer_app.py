@@ -1,28 +1,48 @@
 # app_simple_ui.py
 """
-Flask app — clean UI (no DataTables).
-Upload .xls/.xlsx/.xlsb/.csv/.txt — app shortens Party names, inserts subtotal rows,
-shows preview on the same page (scrollable) and lets you download the modified Excel.
+Excel Summarizer — Flask app (self-contained)
 
-This file is ready for local use and for deployment to services like Render.
+Features:
+- Upload .xls/.xlsx/.xlsb/.csv/.txt
+- Shortens Party names using mapping, inserts subtotal rows per (PartyShort, GSTIN)
+- Shows preview on same page
+- Saves modified Excel to the instance filesystem (temp dir) and provides a stable
+  token-based download URL that works across gunicorn workers
+- Removes files older than CLEANUP_AGE_MIN minutes automatically
 """
 
 import io
 import os
 import re
-import tempfile
+import json
+import time
+import uuid
 import atexit
+import tempfile
+import traceback
 from pathlib import Path
-from zipfile import BadZipFile
+from typing import Optional
+from datetime import datetime, timedelta
 
-from flask import Flask, request, render_template_string, redirect, url_for, flash, send_file
+from flask import (
+    Flask, request, render_template_string, redirect, url_for, flash, send_file, abort
+)
 from werkzeug.utils import secure_filename
 import pandas as pd
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", "change-this-secret-to-something-random")
+# ---------------- CONFIG ----------------
+CLEANUP_AGE_MIN = 60             # delete saved files older than 60 minutes
+TEMP_SAVE_DIR = Path(tempfile.gettempdir()) / "excel_summarizer_uploads"
+INDEX_FILE = TEMP_SAVE_DIR / "index.json"
+ALLOWED_EXT = {".xls", ".xlsx", ".xlsb", ".csv", ".txt", ".xlsm", ".xltx", ".xltm"}
 
-# ---------- Mapping ----------
+TEMP_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------- APP ----------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET", "change_this_secret_in_prod")
+
+# ---------------- MAPPING (user data) ----------------
 MAPPING = [
     ("AKZO NOBEL", "AKZO NOBEL"),
     ("AKZO NOBEL INDIA LTD", "AKZO NOBEL"),
@@ -85,18 +105,20 @@ def determine_party_short(original_name: str) -> str:
             return short.upper()
     return fallback_shorten(original_name)
 
-# ---------- .xls converter (bytes) ----------
+# ---------------- XLS (.xls) -> XLSX converter (bytes) ----------------
 def convert_xls_bytes_to_xlsx_bytes(xls_bytes: bytes) -> bytes:
-    # uses xlrd (1.2.0) and openpyxl
+    """
+    Read .xls bytes using xlrd and write a .xlsx in-memory bytes via openpyxl
+    """
     import xlrd
     from openpyxl import Workbook
     from io import BytesIO
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xls")
     try:
         tmp.write(xls_bytes)
         tmp.flush()
         tmp.close()
-        # read using xlrd (works for .xls)
         book = xlrd.open_workbook(tmp.name, formatting_info=False)
         wb = Workbook()
         try:
@@ -117,28 +139,25 @@ def convert_xls_bytes_to_xlsx_bytes(xls_bytes: bytes) -> bytes:
         except Exception:
             pass
 
-# ---------- Smart reader ----------
-def smart_read_file(file_name: str, content: bytes) -> pd.DataFrame:
-    suf = Path(file_name).suffix.lower()
+# ---------------- smart reader ----------------
+def smart_read_file(filename: str, content: bytes) -> pd.DataFrame:
+    suf = Path(filename).suffix.lower()
+    if suf not in ALLOWED_EXT:
+        raise ValueError(f"Unsupported file extension: {suf}")
     if suf == ".xls":
         xlsx_bytes = convert_xls_bytes_to_xlsx_bytes(content)
         return pd.read_excel(io.BytesIO(xlsx_bytes), engine="openpyxl")
     elif suf in (".xlsx", ".xlsm", ".xltx", ".xltm"):
         return pd.read_excel(io.BytesIO(content), engine="openpyxl")
     elif suf == ".xlsb":
-        # requires pyxlsb
         return pd.read_excel(io.BytesIO(content), engine="pyxlsb")
     elif suf in (".csv", ".txt"):
-        # decode bytes to a text buffer for read_csv
-        try:
-            return pd.read_csv(io.BytesIO(content))
-        except Exception:
-            # try decode as text
-            return pd.read_csv(io.StringIO(content.decode('utf-8', errors='ignore')))
+        # try to decode bytes and read csv
+        return pd.read_csv(io.BytesIO(content))
     else:
-        raise ValueError("Unsupported extension. Use .xls/.xlsx/.xlsb/.csv/.txt")
+        raise ValueError("Unsupported extension")
 
-# ---------- Summarize ----------
+# ---------------- summarizer ----------------
 def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
     if 'Party' not in df.columns or 'GSTIN' not in df.columns:
@@ -151,7 +170,7 @@ def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = 0
     df['Party_Short'] = df['Party'].apply(determine_party_short)
     df['GSTIN'] = df['GSTIN'].astype(str).replace('nan','')
-    # preserve first-appearance order groups
+
     ordered = []
     seen = set()
     for ps, gst in zip(df['Party_Short'], df['GSTIN']):
@@ -159,18 +178,17 @@ def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
         if key not in seen:
             ordered.append(key)
             seen.add(key)
+
     out_rows = []
     final_cols = [c for c in df.columns if c != 'Party_Short']
     for party_short, gstin_key in ordered:
         mask = (df['Party_Short'] == party_short) & (df['GSTIN'] == gstin_key)
         grp = df[mask]
-        # original rows with Party replaced
         for _, r in grp.iterrows():
             row = {}
             for c in final_cols:
                 row[c] = party_short if c == 'Party' else r[c]
             out_rows.append(row)
-        # sums
         sums = {c: round(float(grp[c].sum()), 2) for c in ['TAXABLE','IGST','CGST','SGST','NETAMOUNT']}
         summary = {c: '' for c in final_cols}
         summary['GSTIN'] = gstin_key
@@ -183,8 +201,8 @@ def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
         summary['SGST'] = '' if sums['SGST'] == 0 else sums['SGST']
         summary['NETAMOUNT'] = sums['NETAMOUNT']
         out_rows.append(summary)
+
     res = pd.DataFrame(out_rows, columns=final_cols)
-    # format numeric columns (round)
     for c in ['TAXABLE','IGST','CGST','SGST','NETAMOUNT']:
         if c in res.columns:
             def fmt(x):
@@ -197,35 +215,67 @@ def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
             res[c] = res[c].apply(fmt)
     return res
 
-# ---------- Temp file registry ----------
-TMP_INDEX = {}
-def save_tempfile_and_register(df: pd.DataFrame) -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    tmp.close()
-    df.to_excel(tmp.name, index=False, engine="openpyxl")
-    token = Path(tmp.name).name
-    TMP_INDEX[token] = tmp.name
-    return token
+# ---------------- index helpers ----------------
+def read_index() -> dict:
+    if not INDEX_FILE.exists():
+        return {}
+    try:
+        with INDEX_FILE.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
 
-def cleanup_tempfiles():
-    for token, path in list(TMP_INDEX.items()):
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-    TMP_INDEX.clear()
+def write_index(idx: dict):
+    with INDEX_FILE.open("w", encoding="utf-8") as fh:
+        json.dump(idx, fh)
 
-atexit.register(cleanup_tempfiles)
+def register_saved_file(token: str, path: str, original_name: str):
+    idx = read_index()
+    idx[token] = {
+        "path": path,
+        "original_name": original_name,
+        "created_at": time.time()
+    }
+    write_index(idx)
 
-# ---------- Simple, nicer template ----------
-HTML = """
-<!doctype html>
+def lookup_saved_file(token: str) -> Optional[dict]:
+    idx = read_index()
+    return idx.get(token)
+
+def cleanup_old_files(age_min: int = CLEANUP_AGE_MIN):
+    cutoff = time.time() - (age_min * 60)
+    idx = read_index()
+    changed = False
+    for token, info in list(idx.items()):
+        p = Path(info.get("path", ""))
+        created = info.get("created_at", 0)
+        if (not p.exists()) or (created < cutoff):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+            idx.pop(token, None)
+            changed = True
+    if changed:
+        write_index(idx)
+
+# call cleanup at startup
+cleanup_old_files()
+
+# register cleanup at exit
+@atexit.register
+def _cleanup_on_exit():
+    # optionally leave files or try cleanup now
+    cleanup_old_files()
+
+# ---------------- HTML template (simple, nicer UI) ----------------
+HTML = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <title>Excel Summarizer — Clean UI</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Bootstrap 5 -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     body{background:#f4f6f9; padding:30px;}
@@ -297,18 +347,14 @@ HTML = """
     </div>
   </div>
 </div>
-
-<!-- JS: Bootstrap -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-
 <script>
-// highlight summary rows (where bl_invno cell is empty)
 (function(){
   try {
     const tbl = document.querySelector('.preview-wrap table');
     if (!tbl) return;
     const headers = Array.from(tbl.querySelectorAll('thead th')).map(th => th.innerText.trim().toLowerCase());
-    const invIndex = headers.indexOf('bl_invno');
+    const invIndex = headers.indexOf('bl_invno') >= 0 ? headers.indexOf('bl_invno') : headers.indexOf('bl_invno'.toLowerCase());
     tbl.querySelectorAll('tbody tr').forEach(tr => {
       const tds = tr.querySelectorAll('td');
       if (tds.length > invIndex && invIndex >= 0) {
@@ -316,16 +362,14 @@ HTML = """
         if (!v) tr.classList.add('summary-row');
       }
     });
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) { /* ignore */ }
 })();
 </script>
 </body>
 </html>
 """
 
-# ---------- Routes ----------
+# ---------------- ROUTES ----------------
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
@@ -334,22 +378,29 @@ def index():
             flash("No file uploaded")
             return redirect(request.url)
         filename = secure_filename(uploaded.filename)
+        if not filename:
+            flash("Invalid filename")
+            return redirect(request.url)
+        ext = Path(filename).suffix.lower()
+        if ext not in ALLOWED_EXT:
+            flash("Unsupported file type")
+            return redirect(request.url)
         try:
             content = uploaded.read()
             df = smart_read_file(filename, content)
             df_out = summarize_df(df)
-            token = save_tempfile_and_register(df_out)
+            # save file with token
+            token = uuid.uuid4().hex
+            out_path = TEMP_SAVE_DIR / f"{token}.xlsx"
+            df_out.to_excel(out_path, index=False, engine="openpyxl")
+            register_saved_file(token, str(out_path), filename)
+            # cleanup old files (async not needed — quick run is fine)
+            cleanup_old_files()
             download_url = url_for("download", token=token)
-            # preview
             N_PREVIEW = min(500, len(df_out))
             preview_html = df_out.head(N_PREVIEW).to_html(index=False, classes="table table-sm table-bordered", na_rep="")
             rows_count = len(df_out)
-            groups_count = 0
-            if 'bl_invno' in df_out.columns:
-                try:
-                    groups_count = int(df_out['bl_invno'].astype(str).str.strip().eq('').sum())
-                except Exception:
-                    groups_count = 0
+            groups_count = df_out[df_out.get('bl_invno', '').astype(str).str.strip() == ''].shape[0] if 'bl_invno' in df_out.columns else 0
             return render_template_string(HTML,
                                           preview_html=preview_html,
                                           download_url=download_url,
@@ -357,21 +408,27 @@ def index():
                                           rows_count=rows_count,
                                           groups_count=groups_count)
         except Exception as e:
+            traceback.print_exc()
             flash(f"Error processing file: {e}")
             return redirect(request.url)
     return render_template_string(HTML, preview_html=None)
 
 @app.route("/download/<token>")
 def download(token):
-    path = TMP_INDEX.get(token)
-    if not path or not os.path.exists(path):
+    info = lookup_saved_file(token)
+    if not info:
         return "File not found or expired", 404
-    # use a friendly output file name
-    out_name = f"{Path(path).stem}_modified.xlsx"
-    return send_file(path, as_attachment=True, download_name=out_name)
+    path = Path(info.get("path"))
+    if not path.exists():
+        return "File not found or expired", 404
+    # nice download filename: originalname_modified.xlsx (sanitized)
+    orig = info.get("original_name", "result")
+    stem = Path(orig).stem
+    download_name = f"{secure_filename(stem)}_modified.xlsx"
+    return send_file(path, as_attachment=True, download_name=download_name)
 
-# Run with PORT from environment (Render, Heroku etc. set PORT)
+# ---------------- RUN ----------------
 if __name__ == "__main__":
+    # For local dev: honor PORT env so Render/Heroku style runs locally too
     port = int(os.environ.get("PORT", 5000))
-    # NOTE: On Render you'll use gunicorn in production. This is for local dev.
     app.run(host="0.0.0.0", port=port, debug=True)
