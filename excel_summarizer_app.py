@@ -1,20 +1,28 @@
 # app_simple_ui.py
 """
-Flask app — simple, clean UI (no DataTables).
+Flask app — clean UI (no DataTables).
 Upload .xls/.xlsx/.xlsb/.csv/.txt — app shortens Party names, inserts subtotal rows,
 shows preview on the same page (scrollable) and lets you download the modified Excel.
+
+This file is ready for local use and for deployment to services like Render.
 """
 
-import io, os, re, tempfile, atexit
+import io
+import os
+import re
+import tempfile
+import atexit
 from pathlib import Path
+from zipfile import BadZipFile
+
 from flask import Flask, request, render_template_string, redirect, url_for, flash, send_file
 from werkzeug.utils import secure_filename
 import pandas as pd
 
 app = Flask(__name__)
-app.secret_key = "change-this-secret-to-something-random"
+app.secret_key = os.environ.get("FLASK_SECRET", "change-this-secret-to-something-random")
 
-# ---------- Mapping (same as before) ----------
+# ---------- Mapping ----------
 MAPPING = [
     ("AKZO NOBEL", "AKZO NOBEL"),
     ("AKZO NOBEL INDIA LTD", "AKZO NOBEL"),
@@ -79,6 +87,7 @@ def determine_party_short(original_name: str) -> str:
 
 # ---------- .xls converter (bytes) ----------
 def convert_xls_bytes_to_xlsx_bytes(xls_bytes: bytes) -> bytes:
+    # uses xlrd (1.2.0) and openpyxl
     import xlrd
     from openpyxl import Workbook
     from io import BytesIO
@@ -87,6 +96,7 @@ def convert_xls_bytes_to_xlsx_bytes(xls_bytes: bytes) -> bytes:
         tmp.write(xls_bytes)
         tmp.flush()
         tmp.close()
+        # read using xlrd (works for .xls)
         book = xlrd.open_workbook(tmp.name, formatting_info=False)
         wb = Workbook()
         try:
@@ -116,9 +126,15 @@ def smart_read_file(file_name: str, content: bytes) -> pd.DataFrame:
     elif suf in (".xlsx", ".xlsm", ".xltx", ".xltm"):
         return pd.read_excel(io.BytesIO(content), engine="openpyxl")
     elif suf == ".xlsb":
+        # requires pyxlsb
         return pd.read_excel(io.BytesIO(content), engine="pyxlsb")
     elif suf in (".csv", ".txt"):
-        return pd.read_csv(io.BytesIO(content))
+        # decode bytes to a text buffer for read_csv
+        try:
+            return pd.read_csv(io.BytesIO(content))
+        except Exception:
+            # try decode as text
+            return pd.read_csv(io.StringIO(content.decode('utf-8', errors='ignore')))
     else:
         raise ValueError("Unsupported extension. Use .xls/.xlsx/.xlsb/.csv/.txt")
 
@@ -135,6 +151,7 @@ def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = 0
     df['Party_Short'] = df['Party'].apply(determine_party_short)
     df['GSTIN'] = df['GSTIN'].astype(str).replace('nan','')
+    # preserve first-appearance order groups
     ordered = []
     seen = set()
     for ps, gst in zip(df['Party_Short'], df['GSTIN']):
@@ -147,11 +164,13 @@ def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
     for party_short, gstin_key in ordered:
         mask = (df['Party_Short'] == party_short) & (df['GSTIN'] == gstin_key)
         grp = df[mask]
+        # original rows with Party replaced
         for _, r in grp.iterrows():
             row = {}
             for c in final_cols:
                 row[c] = party_short if c == 'Party' else r[c]
             out_rows.append(row)
+        # sums
         sums = {c: round(float(grp[c].sum()), 2) for c in ['TAXABLE','IGST','CGST','SGST','NETAMOUNT']}
         summary = {c: '' for c in final_cols}
         summary['GSTIN'] = gstin_key
@@ -165,6 +184,7 @@ def summarize_df(df: pd.DataFrame) -> pd.DataFrame:
         summary['NETAMOUNT'] = sums['NETAMOUNT']
         out_rows.append(summary)
     res = pd.DataFrame(out_rows, columns=final_cols)
+    # format numeric columns (round)
     for c in ['TAXABLE','IGST','CGST','SGST','NETAMOUNT']:
         if c in res.columns:
             def fmt(x):
@@ -288,8 +308,7 @@ HTML = """
     const tbl = document.querySelector('.preview-wrap table');
     if (!tbl) return;
     const headers = Array.from(tbl.querySelectorAll('thead th')).map(th => th.innerText.trim().toLowerCase());
-    const invIndex = headers.indexOf('bl_invno') >= 0 ? headers.indexOf('bl_invno') : headers.indexOf('bl_invno'.toLowerCase());
-    // loop tbody rows and add class if the bl_invno cell text is empty
+    const invIndex = headers.indexOf('bl_invno');
     tbl.querySelectorAll('tbody tr').forEach(tr => {
       const tds = tr.querySelectorAll('td');
       if (tds.length > invIndex && invIndex >= 0) {
@@ -321,12 +340,16 @@ def index():
             df_out = summarize_df(df)
             token = save_tempfile_and_register(df_out)
             download_url = url_for("download", token=token)
-            # show first N rows in preview but still single page
+            # preview
             N_PREVIEW = min(500, len(df_out))
             preview_html = df_out.head(N_PREVIEW).to_html(index=False, classes="table table-sm table-bordered", na_rep="")
             rows_count = len(df_out)
-            # groups count: count summary rows we inserted (approx by checking blank bl_invno)
-            groups_count = df_out[df_out['bl_invno'].astype(str).str.strip() == ''].shape[0] if 'bl_invno' in df_out.columns else 0
+            groups_count = 0
+            if 'bl_invno' in df_out.columns:
+                try:
+                    groups_count = int(df_out['bl_invno'].astype(str).str.strip().eq('').sum())
+                except Exception:
+                    groups_count = 0
             return render_template_string(HTML,
                                           preview_html=preview_html,
                                           download_url=download_url,
@@ -343,7 +366,12 @@ def download(token):
     path = TMP_INDEX.get(token)
     if not path or not os.path.exists(path):
         return "File not found or expired", 404
-    return send_file(path, as_attachment=True, download_name=f"{Path(path).stem}_modified.xlsx")
+    # use a friendly output file name
+    out_name = f"{Path(path).stem}_modified.xlsx"
+    return send_file(path, as_attachment=True, download_name=out_name)
 
+# Run with PORT from environment (Render, Heroku etc. set PORT)
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    # NOTE: On Render you'll use gunicorn in production. This is for local dev.
+    app.run(host="0.0.0.0", port=port, debug=True)
